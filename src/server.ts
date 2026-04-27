@@ -112,6 +112,38 @@ initClients().then((success) => {
   }
 });
 
+// Recursively extract plain text from a document body
+function extractTextFromBody(body: any): string {
+  let text = "";
+  if (body?.content) {
+    body.content.forEach((element: any) => {
+      if (element.paragraph) {
+        element.paragraph.elements.forEach((pe: any) => {
+          if (pe.textRun?.content) text += pe.textRun.content;
+        });
+      }
+    });
+  }
+  return text;
+}
+
+// Walk the tab tree (tabs can be nested via childTabs) and return a flat list
+function flattenTabs(tabs: any[]): { tabId: string; title: string; index: number; nestingLevel: number; body: any }[] {
+  const result: { tabId: string; title: string; index: number; nestingLevel: number; body: any }[] = [];
+  for (const tab of tabs || []) {
+    const p = tab.tabProperties || {};
+    result.push({
+      tabId: p.tabId ?? "",
+      title: p.title ?? `Tab ${p.index ?? ""}`,
+      index: p.index ?? 0,
+      nestingLevel: p.nestingLevel ?? 0,
+      body: tab.documentTab?.body,
+    });
+    if (tab.childTabs?.length) result.push(...flattenTabs(tab.childTabs));
+  }
+  return result;
+}
+
 // RESOURCES
 
 // Resource for listing documents
@@ -566,47 +598,102 @@ server.tool(
     try {
       const doc = await docsClient.documents.get({
         documentId: docId,
-      });
-      
-      // Extract the document content
-      let content = `Document: ${doc.data.title}\n\n`;
-      
-      // Process the document content from the complex data structure
+        includeTabsContent: true,
+      } as any);
+
       const document = doc.data;
-      if (document && document.body && document.body.content) {
-        let textContent = "";
-        
-        // Loop through the document's structural elements
-        document.body.content.forEach((element: any) => {
-          if (element.paragraph) {
-            element.paragraph.elements.forEach((paragraphElement: any) => {
-              if (paragraphElement.textRun && paragraphElement.textRun.content) {
-                textContent += paragraphElement.textRun.content;
-              }
-            });
-          }
+      let content = `Document: ${document.title}\n\n`;
+
+      const tabs = flattenTabs((document as any).tabs || []);
+      if (tabs.length > 0) {
+        tabs.forEach(({ title, tabId, body }) => {
+          content += `=== Tab: ${title} (${tabId}) ===\n`;
+          content += extractTextFromBody(body);
+          content += "\n\n";
         });
-        
-        content += textContent;
+      } else {
+        content += extractTextFromBody(document.body);
       }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: content,
-          },
-        ],
-      };
+      return { content: [{ type: "text", text: content }] };
     } catch (error) {
       console.error(`Error getting document ${docId}:`, error);
       return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting document ${docId}: ${error}`,
-          },
-        ],
+        content: [{ type: "text", text: `Error getting document ${docId}: ${error}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool to list all tabs in a document
+server.tool(
+  "list-tabs",
+  {
+    docId: z.string().describe("The ID of the document"),
+  },
+  async ({ docId }) => {
+    try {
+      const doc = await docsClient.documents.get({
+        documentId: docId,
+        includeTabsContent: false,
+      } as any);
+
+      const tabs = flattenTabs((doc.data as any).tabs || []);
+      if (tabs.length === 0) {
+        return { content: [{ type: "text", text: "This document has no tabs (single-tab or legacy document)." }] };
+      }
+
+      let text = `Document: ${doc.data.title}\n${tabs.length} tab(s):\n\n`;
+      tabs.forEach(({ tabId, title, index, nestingLevel }) => {
+        const indent = "  ".repeat(nestingLevel);
+        text += `${indent}Tab ID:   ${tabId}\n`;
+        text += `${indent}Title:    ${title}\n`;
+        text += `${indent}Index:    ${index}\n\n`;
+      });
+
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      console.error(`Error listing tabs for ${docId}:`, error);
+      return {
+        content: [{ type: "text", text: `Error listing tabs: ${error}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool to read the content of a specific tab by tabId
+server.tool(
+  "get-tab",
+  {
+    docId: z.string().describe("The ID of the document"),
+    tabId: z.string().describe("The ID of the tab to read (from list-tabs)"),
+  },
+  async ({ docId, tabId }) => {
+    try {
+      const doc = await docsClient.documents.get({
+        documentId: docId,
+        includeTabsContent: true,
+      } as any);
+
+      const tabs = flattenTabs((doc.data as any).tabs || []);
+      const tab = tabs.find((t) => t.tabId === tabId);
+
+      if (!tab) {
+        return {
+          content: [{ type: "text", text: `Tab "${tabId}" not found. Use list-tabs to see available tab IDs.` }],
+          isError: true,
+        };
+      }
+
+      const text = extractTextFromBody(tab.body);
+      const content = `Document: ${doc.data.title}\nTab: ${tab.title} (${tabId})\n\n${text}`;
+      return { content: [{ type: "text", text: content }] };
+    } catch (error) {
+      console.error(`Error getting tab ${tabId} from ${docId}:`, error);
+      return {
+        content: [{ type: "text", text: `Error getting tab: ${error}` }],
         isError: true,
       };
     }
